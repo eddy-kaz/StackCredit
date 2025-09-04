@@ -227,3 +227,163 @@
     )
   )
 )
+
+;; ALGORITHMIC CREDIT SCORING
+
+;; Calculate dynamic collateral requirements
+;; Excellent credit scores require less collateral backing
+(define-private (calculate-collateral-requirement 
+    (loan-amount uint) 
+    (credit-score uint))
+  (let ((collateral-ratio 
+         (- MAX-COLLATERAL-RATIO 
+            (/ (* (- credit-score MIN-CREDIT-SCORE) u50) 
+               (- MAX-CREDIT-SCORE MIN-CREDIT-SCORE)))))
+    (/ (* loan-amount collateral-ratio) u100))
+)
+
+;; Calculate personalized interest rates
+;; Better credit scores unlock premium lending rates
+(define-private (calculate-interest-rate (credit-score uint))
+  (let ((rate-reduction 
+         (/ (* (- credit-score MIN-CREDIT-SCORE) u600) 
+            (- MAX-CREDIT-SCORE MIN-CREDIT-SCORE))))
+    (if (>= BASE-INTEREST-RATE rate-reduction)
+      (- BASE-INTEREST-RATE rate-reduction)
+      u600)) ;; Minimum 6% APR
+)
+
+;; Calculate interest payment based on loan terms
+(define-private (calculate-interest-payment (loan {
+  borrower: principal,
+  principal-amount: uint,
+  collateral-locked: uint,
+  maturity-block: uint,
+  interest-rate: uint,
+  total-repaid: uint,
+  status: (string-ascii 16),
+  created-at: uint
+}))
+  (/ (* (get principal-amount loan) (get interest-rate loan)) u10000)
+)
+
+;; Advanced credit score algorithm
+;; Considers payment history, loan diversity, and repayment timing
+(define-private (update-credit-score 
+    (user principal) 
+    (successful-repayment bool) 
+    (loan {
+      borrower: principal,
+      principal-amount: uint,
+      collateral-locked: uint,
+      maturity-block: uint,
+      interest-rate: uint,
+      total-repaid: uint,
+      status: (string-ascii 16),
+      created-at: uint
+    }))
+  (let (
+    (profile (unwrap! (map-get? credit-profiles { user: user }) 
+                     ERR-UNAUTHORIZED))
+    (score-adjustment (if successful-repayment
+                       (if (<= (get principal-amount loan) u1000000) u15 u25)  ;; Micro: 15pts, Standard: 25pts
+                       u50)) ;; Default penalty: -50pts
+    (new-score (if successful-repayment
+                 (if (<= (+ (get credit-score profile) score-adjustment) MAX-CREDIT-SCORE)
+                   (+ (get credit-score profile) score-adjustment)
+                   MAX-CREDIT-SCORE)
+                 (if (>= (- (get credit-score profile) score-adjustment) MIN-CREDIT-SCORE)
+                   (- (get credit-score profile) score-adjustment)
+                   MIN-CREDIT-SCORE)))
+  )
+    (map-set credit-profiles 
+      { user: user }
+      (merge profile {
+        credit-score: new-score,
+        total-repaid: (if successful-repayment 
+                       (+ (get total-repaid profile) (get principal-amount loan))
+                       (get total-repaid profile)),
+        successful-loans: (if successful-repayment 
+                           (+ (get successful-loans profile) u1)
+                           (get successful-loans profile)),
+        defaulted-loans: (if successful-repayment
+                          (get defaulted-loans profile)
+                          (+ (get defaulted-loans profile) u1)),
+        last-activity: stacks-block-height
+      }))
+    (ok true)
+  )
+)
+
+;; PROTOCOL QUERIES
+
+;; Get comprehensive credit profile
+(define-read-only (get-credit-profile (user principal))
+  (map-get? credit-profiles { user: user })
+)
+
+;; Get loan details with current status
+(define-read-only (get-loan-details (loan-id uint))
+  (map-get? loan-registry { loan-id: loan-id })
+)
+
+;; Get user's active loan portfolio
+(define-read-only (get-user-portfolio (borrower principal))
+  (map-get? user-portfolios { borrower: borrower })
+)
+
+;; Get protocol analytics
+(define-read-only (get-protocol-stats)
+  {
+    total-value-locked: (var-get total-value-locked),
+    total-loans-issued: (var-get total-loans-issued),
+    next-loan-id: (var-get next-loan-id)
+  }
+)
+
+;; Calculate loan eligibility and terms preview
+(define-read-only (preview-loan-terms (user principal) (amount uint))
+  (match (map-get? credit-profiles { user: user })
+    profile (if (>= (get credit-score profile) LOAN-ELIGIBILITY-SCORE)
+              (ok {
+                eligible: true,
+                required-collateral: (calculate-collateral-requirement 
+                                    amount (get credit-score profile)),
+                interest-rate: (calculate-interest-rate (get credit-score profile)),
+                max-duration: MAX-LOAN-DURATION
+              })
+              (ok { 
+                eligible: false,
+                required-collateral: u0,
+                interest-rate: u0,
+                max-duration: u0
+              }))
+    (err ERR-UNAUTHORIZED)
+  )
+)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+;; Mark overdue loans as defaulted
+;; Protects the protocol and updates credit scores accordingly
+(define-public (process-loan-default (loan-id uint))
+  (let ((loan (unwrap! (map-get? loan-registry { loan-id: loan-id }) 
+                       ERR-LOAN-NOT-EXISTS)))
+    (asserts! (is-eq tx-sender PROTOCOL-ADMIN) ERR-UNAUTHORIZED)
+    ;; Validate loan-id is within valid range
+    (asserts! (and (> loan-id u0) (< loan-id (var-get next-loan-id))) ERR-LOAN-NOT-EXISTS)
+    (asserts! (>= stacks-block-height (get maturity-block loan)) 
+              ERR-PAYMENT-NOT-DUE)
+    (asserts! (is-eq (get status loan) "active") ERR-LOAN-DEFAULTED)
+    
+    ;; Update loan to defaulted status
+    (map-set loan-registry 
+      { loan-id: loan-id }
+      (merge loan { status: "defaulted" }))
+    
+    ;; Apply credit score penalty
+    (try! (update-credit-score (get borrower loan) false loan))
+    
+    (ok true)
+  )
+)

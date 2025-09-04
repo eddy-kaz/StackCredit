@@ -111,3 +111,119 @@
     (ok true)
   )
 )
+
+;; Request loan with dynamic terms based on credit score
+;; Higher credit scores unlock better rates and lower collateral requirements
+(define-public (request-loan 
+    (amount uint) 
+    (collateral uint) 
+    (duration uint))
+  (let (
+    (borrower tx-sender)
+    (loan-id (var-get next-loan-id))
+    (profile (unwrap! (map-get? credit-profiles { user: borrower }) 
+                     ERR-UNAUTHORIZED))
+    (portfolio (default-to { active-loan-ids: (list) } 
+                          (map-get? user-portfolios { borrower: borrower })))
+  )
+    ;; Validate loan request
+    (asserts! (>= (get credit-score profile) LOAN-ELIGIBILITY-SCORE) 
+              ERR-CREDIT-TOO-LOW)
+    (asserts! (<= (len (get active-loan-ids portfolio)) MAX-ACTIVE-LOANS) 
+              ERR-TOO-MANY-LOANS)
+    (asserts! (and (> amount u0) (> duration u0) (<= duration MAX-LOAN-DURATION)) 
+              ERR-INVALID-AMOUNT)
+    
+    ;; Calculate dynamic loan terms
+    (let (
+      (required-collateral (calculate-collateral-requirement 
+                           amount (get credit-score profile)))
+      (interest-rate (calculate-interest-rate (get credit-score profile)))
+    )
+      (asserts! (>= collateral required-collateral) ERR-INSUFFICIENT-FUNDS)
+      
+      ;; Lock collateral
+      (try! (stx-transfer? collateral borrower (as-contract tx-sender)))
+      
+      ;; Create loan record
+      (map-set loan-registry 
+        { loan-id: loan-id }
+        {
+          borrower: borrower,
+          principal-amount: amount,
+          collateral-locked: collateral,
+          maturity-block: (+ stacks-block-height duration),
+          interest-rate: interest-rate,
+          total-repaid: u0,
+          status: "active",
+          created-at: stacks-block-height
+        })
+      
+      ;; Update user portfolio
+      (map-set user-portfolios 
+        { borrower: borrower }
+        { active-loan-ids: (unwrap! 
+                           (as-max-len? 
+                            (append (get active-loan-ids portfolio) loan-id) u10)
+                           ERR-TOO-MANY-LOANS) })
+      
+      ;; Transfer loan amount to borrower
+      (as-contract (try! (stx-transfer? amount tx-sender borrower)))
+      
+      ;; Update protocol state
+      (var-set next-loan-id (+ loan-id u1))
+      (var-set total-value-locked (+ (var-get total-value-locked) collateral))
+      (var-set total-loans-issued (+ (var-get total-loans-issued) u1))
+      
+      (ok loan-id)
+    )
+  )
+)
+
+;; Process loan repayment with credit score updates
+;; Successful repayments improve credit scores and unlock better terms
+(define-public (repay-loan (loan-id uint) (payment-amount uint))
+  (let (
+    (borrower tx-sender)
+    (loan (unwrap! (map-get? loan-registry { loan-id: loan-id }) 
+                   ERR-LOAN-NOT-EXISTS))
+  )
+    (asserts! (is-eq borrower (get borrower loan)) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get status loan) "active") ERR-LOAN-DEFAULTED)
+    (asserts! (> payment-amount u0) ERR-INVALID-AMOUNT)
+    
+    ;; Calculate total amount due
+    (let ((total-due (+ (get principal-amount loan)
+                       (calculate-interest-payment loan))))
+      
+      ;; Process payment
+      (try! (stx-transfer? payment-amount borrower (as-contract tx-sender)))
+      
+      (let ((new-total-repaid (+ (get total-repaid loan) payment-amount)))
+        ;; Update loan status
+        (map-set loan-registry 
+          { loan-id: loan-id }
+          (merge loan {
+            total-repaid: new-total-repaid,
+            status: (if (>= new-total-repaid total-due) "completed" "active")
+          }))
+        
+        ;; If fully repaid, update credit score and release collateral
+        (if (>= new-total-repaid total-due)
+          (begin
+            (try! (update-credit-score borrower true loan))
+            (as-contract (try! (stx-transfer? 
+                               (get collateral-locked loan) 
+                               tx-sender 
+                               borrower)))
+            (var-set total-value-locked 
+                    (- (var-get total-value-locked) 
+                       (get collateral-locked loan)))
+          )
+          true
+        )
+        (ok true)
+      )
+    )
+  )
+)
